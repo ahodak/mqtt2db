@@ -20,40 +20,41 @@ import signal
 import sys
 import ast
 
+# Загрузка конфигурации
+config = configparser.ConfigParser()
+config.read('config.ini')
+
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/var/log/mqtt2db.log'),
+        logging.FileHandler(config['logging']['log_file']),
         logging.StreamHandler()
     ]
 )
-
-# Загрузка конфигурации
-config = configparser.ConfigParser()
-config.read('/etc/mqtt2db/config.ini')
 
 # Получение значения из вложенного JSON по пути
 def get_nested_value(data, path):
     try:
         for key in path.split('.'):
+            if key.isdigit():  # Если ключ - это индекс массива
+                key = int(key)
             data = data[key]
         return data
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, IndexError):
+        logging.debug(f"Не удалось получить значение по пути {path}")
         return None
 
 class MQTT2DB:
     def __init__(self):
         self.db_path = config['database']['path']
         self.retention_days = int(config['database']['retention_days'])
-        self.verbose =  False
         
         # Загружаем конфигурацию топиков
         self.topics = {}
         for section in config.sections():
             if section.startswith('topic.'):
-                topic_name = section.split('.')[1]
                 topic_config = {
                     'topic': config[section]['topic'],
                     'fields': ast.literal_eval(config[section]['fields'])
@@ -67,14 +68,22 @@ class MQTT2DB:
         self.init_database()
         
         # Настройка MQTT клиента
-        self.client = mqtt.Client()
+        self.client = mqtt.Client(client_id="mqtt2db", clean_session=True)
         self.client.username_pw_set(
             config['mqtt']['username'],
             config['mqtt']['password']
         )
+        
+        # Установка обработчиков событий
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
+        
+        # Настройка автоматического переподключения
+        self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+        
+        # Флаг для отслеживания состояния подключения
+        self.connected = False
 
     def init_database(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -101,8 +110,7 @@ class MQTT2DB:
                 ON sensor_data(timestamp)
             ''')
             conn.commit()
-            if self.verbose:
-                logging.info("База данных инициализирована")
+            logging.info("База данных инициализирована")
 
     def cleanup_old_data(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -113,21 +121,26 @@ class MQTT2DB:
                 (cutoff_date,)
             )
             conn.commit()
-            if self.verbose:
-                logging.info(f"Удалено {cursor.rowcount} строк")
+            logging.info(f"Удаление старых данных: удалено {cursor.rowcount} строк")
 
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
+            self.connected = True
             logging.info("Подключено к MQTT брокеру")
             # Подписываемся на все топики
             for topic in self.topics.keys():
                 client.subscribe(topic)
                 logging.info(f"Подписка на топик: {topic}")
         else:
+            self.connected = False
             logging.error(f"Ошибка подключения к MQTT брокеру, код: {rc}")
 
     def on_disconnect(self, client, userdata, rc):
-        logging.info("Отключено от MQTT брокера. Код: {rc}")
+        self.connected = False
+        if rc != 0:
+            logging.warning(f"Неожиданное отключение от MQTT брокера. Код: {rc}")
+        else:
+            logging.info("Отключено от MQTT брокера")
 
     def on_message(self, client, userdata, msg):
         try:
@@ -156,13 +169,25 @@ class MQTT2DB:
                 '''
                 cursor.execute(query, list(values.values()))
                 conn.commit()
-                if self.verbose:
-                    logging.info(f"Сохранены значения для топика {topic}: {values}")
+                logging.debug(f"Сохранены значения для топика {topic}: {values}")
             
         except json.JSONDecodeError:
             logging.error(f"Ошибка декодирования JSON из топика {topic}")
         except Exception as e:
             logging.error(f"Ошибка обработки сообщения из топика {topic}: {str(e)}")
+
+    def connect_mqtt(self):
+        try:
+            # Установка соединения с брокером
+            self.client.connect(
+                config['mqtt']['broker'],
+                int(config['mqtt']['port']),
+                keepalive=60
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка подключения к MQTT брокеру: {str(e)}")
+            return False
 
     def run(self):
         # Обработка сигналов завершения
@@ -170,23 +195,31 @@ class MQTT2DB:
         signal.signal(signal.SIGINT, self.signal_handler)
         
         try:
-            self.client.connect(
-                config['mqtt']['broker'],
-                int(config['mqtt']['port']),
-                60
-            )
+            # Попытка подключения к брокеру
+            if not self.connect_mqtt():
+                logging.error("Не удалось подключиться к MQTT брокеру")
+                sys.exit(1)
             
             # Запускаем очистку старых данных раз в сутки
             self.cleanup_old_data()
             
-            self.client.loop_forever()
+            # Запуск цикла обработки сообщений
+            self.client.loop_start()
             
+            # Основной цикл программы
+            while True:
+                if not self.connected:
+                    logging.warning("Соединение потеряно, ожидание восстановления...")
+                signal.pause()
+                
         except Exception as e:
-            logging.error(f"Ошибка запуска: {str(e)}")
+            logging.error(f"Ошибка выполнения: {str(e)}")
+            self.client.loop_stop()
             sys.exit(1)
 
     def signal_handler(self, signum, frame):
         logging.info("Получен сигнал завершения, останавливаем сервис...")
+        self.client.loop_stop()
         self.client.disconnect()
         sys.exit(0)
 

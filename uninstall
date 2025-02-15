@@ -1,0 +1,29 @@
+#!/bin/bash
+
+echo "Начинаем удаление MQTT2DB..."
+
+# Останавливаем и отключаем сервис
+echo "Останавливаем сервис..."
+sudo systemctl stop mqtt2db
+sudo systemctl disable mqtt2db
+
+# Удаляем файлы сервиса
+echo "Удаляем файлы сервиса..."
+sudo rm -f /usr/local/bin/mqtt2db.py
+sudo rm -f /etc/systemd/system/mqtt2db.service
+sudo rm -rf /etc/mqtt2db
+
+# Удаляем данные и логи
+echo "Удаляем данные и логи..."
+sudo rm -rf /var/lib/mqtt2db
+sudo rm -f /var/log/mqtt2db.log
+
+# Удаляем пользователя
+echo "Удаляем пользователя mqtt2db..."
+sudo userdel mqtt2db
+
+# Перезагружаем systemd
+echo "Перезагружаем systemd..."
+sudo systemctl daemon-reload
+
+echo "Удаление MQTT2DB завершено"
