@@ -25,7 +25,7 @@ LOG_FILE = '/var/log/mqtt2db.log'
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
@@ -37,8 +37,9 @@ logging.basicConfig(
 try:
     config = configparser.ConfigParser()
     if not config.read('config.ini'):
-        logging.error("Не удалось прочитать файл конфигурации config.ini")
-        sys.exit(1)
+        if not config.read('\etc\mqtt2db\config.ini'):
+            logging.error("Не удалось прочитать файл конфигурации config.ini")
+            sys.exit(1)
 except Exception as e:
     logging.error(f"Ошибка при чтении конфигурации: {str(e)}")
     sys.exit(1)
