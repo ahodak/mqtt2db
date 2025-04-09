@@ -10,6 +10,7 @@ MQTT2DB - это Python-сервис для сохранения данных и
 - Поддержка вложенных JSON-структур
 - Настраиваемый период хранения данных
 - Логирование всех операций
+- Отдельные таблицы для каждого топика
 
 ## Установка
 
@@ -53,10 +54,10 @@ username = your_username
 password = your_password
 
 [database]
-path = /var/lib/mqtt2db/data.db
+path = /var/lib/mqtt2db/data.sqlite
 retention_days = 365
 
-[topic.example]
+[table.example]
 topic = your/mqtt/topic
 fields = {
     "json.path": "database_field"
@@ -65,12 +66,14 @@ fields = {
 
 ### Настройка топиков
 
-Каждый топик настраивается в отдельной секции `[topic.name]`:
+Каждый топик настраивается в отдельной секции `[table.name]`:
 
 - `topic` - MQTT-топик для подписки
 - `fields` - словарь маппинга полей из JSON в базу данных
   - ключ - путь к значению в JSON (поддерживается вложенность через точку)
   - значение - название поля в базе данных
+
+Название секции `[table.name]` определяет имя таблицы в базе данных (без префикса 'table.').
 
 ## Использование
 
@@ -84,16 +87,32 @@ python3 /usr/local/bin/mqtt2db.py
 
 ## Структура базы данных
 
-База данных SQLite создается автоматически со следующей структурой:
+Для каждого топика создается отдельная таблица в базе данных SQLite. Название таблицы соответствует названию секции в конфигурации без префикса 'table.'.
 
-- `timestamp` - время получения данных
-- `topic` - MQTT-топик
-- Дополнительные поля создаются автоматически на основе конфигурации топиков
+Структура каждой таблицы:
+- `timestamp` - время получения данных (DATETIME)
+- Поля, указанные в конфигурации топика (REAL)
+
+Например, для конфигурации:
+```ini
+[table.opentherm]
+topic = opentherm/status
+fields = {
+    "master.heating.currentTemp": "heating_temp",
+    "master.heating.indoorTemp": "indoor_temp",
+    "master.dhw.currentTemp": "dhw_temp"
+}
+```
+
+Будет создана таблица `opentherm` со следующими полями:
+- timestamp (DATETIME)
+- heating_temp (REAL)
+- indoor_temp (REAL)
+- dhw_temp (REAL)
 
 ## Логирование
 
 Логи сохраняются в:
-
 - `/var/log/mqtt2db.log`
 - Также выводятся в стандартный вывод
 

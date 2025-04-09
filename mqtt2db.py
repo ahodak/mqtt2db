@@ -20,19 +20,47 @@ import signal
 import sys
 import ast
 
-# Загрузка конфигурации
-config = configparser.ConfigParser()
-config.read('config.ini')
+# Константы
+LOG_FILE = '/var/log/mqtt2db.log'
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(config['logging']['log_file']),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
+
+# Загрузка конфигурации
+try:
+    config = configparser.ConfigParser()
+    if not config.read('config.ini'):
+        logging.error("Не удалось прочитать файл конфигурации config.ini")
+        sys.exit(1)
+except Exception as e:
+    logging.error(f"Ошибка при чтении конфигурации: {str(e)}")
+    sys.exit(1)
+
+# Проверка обязательных секций
+required_sections = ['mqtt', 'database']
+for section in required_sections:
+    if section not in config:
+        logging.error(f"Отсутствует обязательная секция [{section}] в конфигурации")
+        sys.exit(1)
+
+# Проверка обязательных параметров в секциях
+required_params = {
+    'mqtt': ['broker', 'port', 'username', 'password'],
+    'database': ['path', 'retention_days']
+}
+
+for section, params in required_params.items():
+    for param in params:
+        if param not in config[section]:
+            logging.error(f"Отсутствует обязательный параметр {param} в секции [{section}]")
+            sys.exit(1)
 
 # Получение значения из вложенного JSON по пути
 def get_nested_value(data, path):
@@ -48,67 +76,84 @@ def get_nested_value(data, path):
 
 class MQTT2DB:
     def __init__(self):
-        self.db_path = config['database']['path']
-        self.retention_days = int(config['database']['retention_days'])
-        
-        # Загружаем конфигурацию топиков
-        self.topics = {}
-        for section in config.sections():
-            if section.startswith('topic.'):
-                topic_config = {
-                    'topic': config[section]['topic'],
-                    'fields': ast.literal_eval(config[section]['fields'])
-                }
-                self.topics[topic_config['topic']] = topic_config['fields']
-        
-        # Создаем директорию для базы данных если её нет
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        
-        # Инициализация базы данных
-        self.init_database()
-        
-        # Настройка MQTT клиента
-        self.client = mqtt.Client(client_id="mqtt2db", clean_session=True)
-        self.client.username_pw_set(
-            config['mqtt']['username'],
-            config['mqtt']['password']
-        )
-        
-        # Установка обработчиков событий
-        self.client.on_connect = self.on_connect
-        self.client.on_disconnect = self.on_disconnect
-        self.client.on_message = self.on_message
-        
-        # Настройка автоматического переподключения
-        self.client.reconnect_delay_set(min_delay=1, max_delay=60)
-        
-        # Флаг для отслеживания состояния подключения
-        self.connected = False
+        try:
+            self.db_path = config['database']['path']
+            self.retention_days = int(config['database']['retention_days'])
+            
+            # Загружаем конфигурацию топиков
+            self.topics = {}
+            for section in config.sections():
+                if section.startswith('table.'):
+                    try:
+                        topic_config = {
+                            'topic': config[section]['topic'],
+                            'fields': ast.literal_eval(config[section]['fields'])
+                        }
+                        self.topics[topic_config['topic']] = topic_config['fields']
+                    except KeyError as e:
+                        logging.error(f"Отсутствует обязательный параметр в секции [{section}]: {str(e)}")
+                        sys.exit(1)
+                    except (SyntaxError, ValueError) as e:
+                        logging.error(f"Ошибка в формате поля fields в секции [{section}]: {str(e)}")
+                        sys.exit(1)
+            
+            # Создаем директорию для базы данных если её нет
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            
+            # Инициализация базы данных
+            self.init_database()
+            
+            # Настройка MQTT клиента
+            self.client = mqtt.Client(client_id="mqtt2db", clean_session=True)
+            self.client.username_pw_set(
+                config['mqtt']['username'],
+                config['mqtt']['password']
+            )
+            
+            # Установка обработчиков событий
+            self.client.on_connect = self.on_connect
+            self.client.on_disconnect = self.on_disconnect
+            self.client.on_message = self.on_message
+            
+            # Настройка автоматического переподключения
+            self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+            
+            # Флаг для отслеживания состояния подключения
+            self.connected = False
+            
+        except Exception as e:
+            logging.error(f"Ошибка при инициализации: {str(e)}")
+            sys.exit(1)
 
     def init_database(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
-            # Собираем все уникальные поля из всех топиков
-            all_fields = set()
-            for fields in self.topics.values():
-                all_fields.update(fields.values())
+            # Создаем таблицу для каждого топика
+            for section in config.sections():
+                if section.startswith('table.'):
+                    table_name = section[6:]  # Убираем префикс 'table.'
+                    fields = ast.literal_eval(config[section]['fields'])
+                    
+                    # Создаем SQL-запрос для создания таблицы
+                    columns = ['timestamp DATETIME DEFAULT CURRENT_TIMESTAMP']
+                    for json_path, db_field in fields.items():
+                        columns.append(f'{db_field} REAL')
+                    
+                    create_table_sql = f'''
+                        CREATE TABLE IF NOT EXISTS {table_name} (
+                            {', '.join(columns)}
+                        )
+                    '''
+                    
+                    cursor.execute(create_table_sql)
+                    
+                    # Создаем индекс по времени для быстрой очистки старых данных
+                    cursor.execute(f'''
+                        CREATE INDEX IF NOT EXISTS idx_{table_name}_timestamp 
+                        ON {table_name}(timestamp)
+                    ''')
             
-            # Создаем таблицу для данных
-            columns = ', '.join([f'{field} REAL' for field in all_fields])
-            cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS sensor_data (
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    topic TEXT,
-                    {columns}
-                )
-            ''')
-            
-            # Создаем индекс по времени для быстрой очистки старых данных
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_timestamp 
-                ON sensor_data(timestamp)
-            ''')
             conn.commit()
             logging.info("База данных инициализирована")
 
@@ -116,12 +161,18 @@ class MQTT2DB:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cutoff_date = datetime.now() - timedelta(days=self.retention_days)
-            cursor.execute(
-                'DELETE FROM sensor_data WHERE timestamp < ?',
-                (cutoff_date,)
-            )
+            
+            # Очищаем старые данные во всех таблицах топиков
+            for section in config.sections():
+                if section.startswith('table.'):
+                    table_name = section[6:]  # Убираем префикс 'table.'
+                    cursor.execute(
+                        f'DELETE FROM {table_name} WHERE timestamp < ?',
+                        (cutoff_date,)
+                    )
+                    logging.info(f"Удаление старых данных из таблицы {table_name}: удалено {cursor.rowcount} строк")
+            
             conn.commit()
-            logging.info(f"Удаление старых данных: удалено {cursor.rowcount} строк")
 
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -151,8 +202,19 @@ class MQTT2DB:
             data = json.loads(msg.payload)
             field_mappings = self.topics[topic]
             
+            # Находим имя таблицы по топику
+            table_name = None
+            for section in config.sections():
+                if section.startswith('table.') and config[section]['topic'] == topic:
+                    table_name = section[6:]  # Убираем префикс 'table.'
+                    break
+            
+            if not table_name:
+                logging.error(f"Не найдена таблица для топика {topic}")
+                return
+            
             # Создаем словарь значений для записи
-            values = {'topic': topic}
+            values = {}
             for json_path, db_field in field_mappings.items():
                 value = get_nested_value(data, json_path)
                 values[db_field] = value if value is not None else None
@@ -160,16 +222,16 @@ class MQTT2DB:
             # Сохраняем в базу данных
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                columns = ['topic'] + list(values.keys())[1:]
+                columns = list(values.keys())
                 placeholders = ','.join(['?' for _ in values])
                 query = f'''
-                    INSERT INTO sensor_data 
+                    INSERT INTO {table_name} 
                     ({','.join(columns)}) 
                     VALUES ({placeholders})
                 '''
                 cursor.execute(query, list(values.values()))
                 conn.commit()
-                logging.debug(f"Сохранены значения для топика {topic}: {values}")
+                logging.debug(f"Сохранены значения для топика {topic} в таблицу {table_name}: {values}")
             
         except json.JSONDecodeError:
             logging.error(f"Ошибка декодирования JSON из топика {topic}")
