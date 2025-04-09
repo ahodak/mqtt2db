@@ -37,7 +37,7 @@ logging.basicConfig(
 try:
     config = configparser.ConfigParser()
     if not config.read('config.ini'):
-        if not config.read('\etc\mqtt2db\config.ini'):
+        if not config.read('/etc/mqtt2db/config.ini'):
             logging.error("Не удалось прочитать файл конфигурации config.ini")
             sys.exit(1)
 except Exception as e:
